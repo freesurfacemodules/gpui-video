@@ -7,14 +7,14 @@ use core_foundation::{
     string::CFString,
 };
 #[cfg(target_os = "macos")]
-use core_video::pixel_buffer::{CVPixelBuffer, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange};
+use core_video::pixel_buffer::{kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, CVPixelBuffer};
 #[cfg(target_os = "macos")]
 use core_video::r#return::kCVReturnSuccess;
 use gpui::{
     Element, ElementId, GlobalElementId, InspectorElementId, IntoElement, LayoutId, Window,
 };
 use std::sync::Arc;
-use yuv::{YuvBiPlanarImage, YuvConversionMode, YuvRange, YuvStandardMatrix, yuv_nv12_to_bgra};
+use yuv::{yuv_nv12_to_bgra, YuvBiPlanarImage, YuvConversionMode, YuvRange, YuvStandardMatrix};
 
 /// A video element that implements Element trait similar to GPUI's img element
 pub struct VideoElement {
@@ -409,32 +409,16 @@ impl Element for VideoElement {
         window: &mut Window,
         cx: &mut gpui::App,
     ) {
-        // Prefer buffered frames if available. Drain to the latest to avoid lag.
-        let buffered = self.video.buffered_len();
-        let mut frame_to_render: Option<(Vec<u8>, u32, u32)> = None;
-        let mut from_buffer = false;
-        if buffered > 0 {
-            for _ in 0..buffered {
-                if let Some(frame) = self.video.pop_buffered_frame() {
-                    frame_to_render = Some(frame);
-                }
-            }
-            from_buffer = frame_to_render.is_some();
+        // FIX: Take only ONE frame, not all buffered frames
+        let frame_to_render: Option<(Vec<u8>, u32, u32)> = if self.video.buffered_len() > 0 {
+            // Pop only the NEXT frame to render
+            self.video.pop_buffered_frame()
         } else {
-            frame_to_render = self.video.current_frame_data();
-        }
+            // Fall back to current frame
+            self.video.current_frame_data()
+        };
 
         if let Some((yuv_data, frame_width, frame_height)) = frame_to_render {
-            if from_buffer {
-                log::debug!(
-                    "Painting frame from buffer (buffered_len before drain: {})",
-                    buffered
-                );
-            } else {
-                log::debug!("Painting frame from live current_frame_data()");
-            }
-
-            // On macOS, upload via CVPixelBuffer + paint_surface to avoid atlas growth
             #[cfg(target_os = "macos")]
             {
                 if self.try_paint_surface_macos(

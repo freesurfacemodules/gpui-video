@@ -23,7 +23,8 @@ impl WithControlsExample {
     fn click_allowed(&mut self) -> bool {
         let now = Instant::now();
         if let Some(prev) = self.last_click {
-            if now.saturating_duration_since(prev) < Duration::from_millis(250) {
+            if now.saturating_duration_since(prev) < Duration::from_millis(100) {
+                // 100ms instead of 250ms
                 return false;
             }
         }
@@ -132,7 +133,7 @@ fn main() {
     env_logger::init();
     Application::new().run(|cx: &mut App| {
         let uri = Url::from_file_path(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("./assets/bigbuckbunny.mp4"),
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("./assets/optimum_oled.mp4"),
         )
         .expect("invalid file path");
 
@@ -145,10 +146,10 @@ fn main() {
                 gpui_component::init(cx);
 
                 let options = VideoOptions {
-                    frame_buffer_capacity: Some(60),  // Buffer 60 frames
-                    looping: Some(true),               // Enable looping
-                    speed: Some(1.0),                  // Normal speed
-                    prebuffer_frames: Some(10),        // Pre-buffer 10 frames
+                    frame_buffer_capacity: Some(60), // Buffer 60 frames
+                    looping: Some(true),             // Enable looping
+                    speed: Some(1.0),                // Normal speed
+                    prebuffer_frames: Some(10),      // Pre-buffer 10 frames
                 };
 
                 let video = Video::new_with_options(&uri, options).expect("failed to create video");

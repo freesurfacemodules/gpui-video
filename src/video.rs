@@ -101,16 +101,24 @@ impl AudioRingBuffer {
     fn read(&mut self, output: &mut [f32]) -> usize {
         let available = self.len.min(output.len());
 
-        for i in 0..available {
-            output[i] = self.buffer[self.read_pos];
-            self.read_pos = (self.read_pos + 1) % self.capacity;
+        // Fast path: contiguous read
+        if self.read_pos + available <= self.capacity {
+            output[..available]
+                .copy_from_slice(&self.buffer[self.read_pos..self.read_pos + available]);
+            self.read_pos = (self.read_pos + available) % self.capacity; // FIX: Add modulo
+        } else {
+            // Wraparound case
+            for i in 0..available {
+                output[i] = self.buffer[self.read_pos];
+                self.read_pos = (self.read_pos + 1) % self.capacity;
+            }
         }
 
         self.len -= available;
 
         // Fill remaining with silence
-        for sample in output.iter_mut().skip(available) {
-            *sample = 0.0;
+        if available < output.len() {
+            output[available..].fill(0.0);
         }
 
         available
@@ -210,25 +218,34 @@ impl std::fmt::Debug for Internal {
 
 impl Internal {
     pub(crate) fn seek(&self, position: impl Into<Position>, accurate: bool) -> Result<(), Error> {
-        let timestamp = match position.into() {
-            Position::Time(duration) => {
-                let seconds = duration.as_secs_f64();
-                (seconds * self.time_base.denominator() as f64 / self.time_base.numerator() as f64)
-                    as i64
-            }
+        let position = position.into();
+
+        // Calculate target time in seconds
+        let target_seconds = match position {
+            Position::Time(duration) => duration.as_secs_f64(),
             Position::Frame(frame_num) => {
                 let time_per_frame = 1.0 / self.framerate;
-                let seconds = frame_num as f64 * time_per_frame;
-                (seconds * self.time_base.denominator() as f64 / self.time_base.numerator() as f64)
-                    as i64
+                frame_num as f64 * time_per_frame
             }
         };
+
+        // Convert to timestamp for FFmpeg
+        let timestamp = (target_seconds * self.time_base.denominator() as f64
+            / self.time_base.numerator() as f64) as i64;
 
         self.is_eos.store(false, Ordering::Release);
         self.frame_buffer.lock().clear();
         self.audio_ring.lock().clear();
-        *self.audio_clock.lock() = Duration::ZERO;
-        self.samples_played.store(0, Ordering::SeqCst);
+
+        // FIX: Set audio clock to the seek target time, not zero!
+        let target_duration = Duration::from_secs_f64(target_seconds);
+        *self.audio_clock.lock() = target_duration;
+
+        // FIX: Calculate samples_played for the target time
+        let samples_for_target = (target_seconds * self.sample_rate as f64 * 2.0) as u64;
+        self.samples_played
+            .store(samples_for_target, Ordering::SeqCst);
+
         *self.playback_start.lock() = None;
 
         self.command_tx
@@ -388,7 +405,7 @@ impl Video {
         ));
 
         // Audio ring buffer - 2 seconds at 48kHz stereo
-        let audio_ring = Arc::new(Mutex::new(AudioRingBuffer::new(48000 * 2 * 2)));
+        let audio_ring = Arc::new(Mutex::new(AudioRingBuffer::new(48000 * 2 * 4)));
         let audio_clock = Arc::new(Mutex::new(Duration::ZERO));
         let samples_played = Arc::new(AtomicU64::new(0));
 
@@ -570,7 +587,7 @@ impl Video {
             Pixel::NV12,
             decoder.width(),
             decoder.height(),
-            Flags::BILINEAR,
+            Flags::LANCZOS,
         )
         .map_err(|_| Error::Caps)?;
 
@@ -629,7 +646,11 @@ impl Video {
                         current_pts.store(timestamp as u64, Ordering::SeqCst);
                         frame_buffer.lock().clear();
                         audio_ring.lock().clear();
-                        samples_played.store(0, Ordering::SeqCst);
+
+                        // FIX: Don't reset samples_played - already set by seek() function
+                        // Remove these lines:
+                        // samples_played.store(0, Ordering::SeqCst);
+
                         prebuffering = true;
                         *playback_start.lock() = None;
                     }
@@ -675,15 +696,34 @@ impl Video {
             // Pre-buffering phase
             if prebuffering && !paused {
                 let vbuf_len = frame_buffer.lock().len();
-                if vbuf_len >= prebuffer_frames {
+                if vbuf_len >= prebuffer_frames.max(10) {
                     prebuffering = false;
-                    // Initialize playback start time when we start playing
+
                     if let Some(first_frame) = frame_buffer.lock().front() {
-                        *playback_start.lock() = Some((Instant::now(), first_frame.timestamp));
+                        let first_ts = first_frame.timestamp;
+
+                        // FIX: Only set playback_start once with the correct timestamp
+                        if audio_decoder.is_some() {
+                            let current_audio_clock = *audio_clock.lock();
+
+                            if current_audio_clock == Duration::ZERO {
+                                // Initial playback - use first frame timestamp
+                                *audio_clock.lock() = first_ts;
+                                let samples_for_ts =
+                                    (first_ts.as_secs_f64() * output_sample_rate as f64 * 2.0)
+                                        as u64;
+                                samples_played.store(samples_for_ts, Ordering::SeqCst);
+                                *playback_start.lock() = Some((Instant::now(), first_ts));
+                            } else {
+                                // After seek - use current audio clock (already set by seek)
+                                *playback_start.lock() =
+                                    Some((Instant::now(), current_audio_clock));
+                            }
+                        } else {
+                            // No audio - use first frame timestamp
+                            *playback_start.lock() = Some((Instant::now(), first_ts));
+                        }
                     }
-                    // For audio sync, reset the samples counter when starting
-                    samples_played.store(0, Ordering::SeqCst);
-                    *audio_clock.lock() = Duration::ZERO;
                 }
             }
 
@@ -701,7 +741,9 @@ impl Video {
             };
 
             // Keep buffers full
-            let should_decode = prebuffering || vbuf_len < vbuf_cap || audio_space > 4800;
+            let should_decode = prebuffering
+                || vbuf_len < vbuf_cap
+                || audio_space > (output_sample_rate * 2) as usize;
 
             if should_decode {
                 match Self::decode_next_packet(
@@ -745,35 +787,50 @@ impl Video {
 
                 let mut buf = frame_buffer.lock();
 
-                // Try to present the next frame if it's time
+                // Simplified: present frame if its time has come
                 if let Some(next_frame) = buf.front() {
-                    let target_time = next_frame.timestamp.as_secs_f64();
+                    let frame_time = next_frame.timestamp.as_secs_f64();
                     let current_time_secs = current_time.as_secs_f64();
+                    let time_diff = current_time_secs - frame_time;
 
-                    // Calculate how far ahead/behind we are
-                    let time_diff = current_time_secs - target_time;
-
-                    // Present the frame if:
-                    // 1. We're past its timestamp
-                    // 2. We're within one frame duration of its timestamp (to avoid waiting too long)
-                    let frame_duration_secs = frame_duration.as_secs_f64() / current_speed;
-
-                    if time_diff >= 0.0 || time_diff.abs() < frame_duration_secs * 0.1 {
+                    // Present if we're at or past the frame's time (within small tolerance)
+                    // Present if we're at or past the frame's time (tighter tolerance)
+                    if time_diff >= -0.002 {
+                        // 2ms tolerance instead of 5ms
                         let presented = buf.pop_front().unwrap();
                         current_pts.store(presented.pts as u64, Ordering::SeqCst);
                         *frame.lock() = presented;
                         upload_frame.store(true, Ordering::SeqCst);
-                    } else if time_diff < -frame_duration_secs {
-                        // We're way ahead - sleep a bit longer
-                        drop(buf); // Release lock before sleeping
-                        std::thread::sleep(Duration::from_millis(5));
+
+                        // Don't skip frames unless we're significantly behind
+                        let mut skip_count = 0;
+                        while !buf.is_empty()
+                            && skip_count < 1
+                            && buf.front().unwrap().timestamp.as_secs_f64()
+                                < (current_time_secs - 0.100)
+                        // 100ms behind
+                        {
+                            if let Some(skip_frame) = buf.pop_front() {
+                                *frame.lock() = skip_frame.clone();
+                                skip_count += 1;
+                                log::warn!(
+                                    "Dropped frame - {}s behind",
+                                    current_time_secs - skip_frame.timestamp.as_secs_f64()
+                                );
+                            }
+                        }
+                    } else if time_diff < -0.010 {
+                        // 10ms early
+                        // Too early - wait
+                        drop(buf);
+                        std::thread::sleep(Duration::from_millis(2));
                         continue;
                     }
                 }
             }
 
             // Sleep to prevent busy-waiting
-            std::thread::sleep(Duration::from_millis(if prebuffering { 10 } else { 2 }));
+            std::thread::sleep(Duration::from_millis(if prebuffering { 10 } else { 1 }));
         }
 
         Ok(())
@@ -790,10 +847,15 @@ impl Video {
         if has_audio {
             // Use audio clock - most accurate
             let played = samples_played.load(Ordering::SeqCst);
-            // samples_played counts individual f32 samples (stereo interleaved)
-            // So divide by sample_rate * 2 to get seconds
+
+            // Calculate actual time from samples
+            // For stereo: samples_played = total f32 values = frames * 2
+            // So: seconds = samples_played / (sample_rate * channels)
             let audio_time = Duration::from_secs_f64(played as f64 / (sample_rate as f64 * 2.0));
+
+            // Update the shared audio clock
             *audio_clock.lock() = audio_time;
+
             audio_time
         } else {
             // Use system clock with speed adjustment
@@ -979,6 +1041,15 @@ impl Video {
 
                     let mut ring = audio_ring.lock();
                     let read_count = ring.read(data);
+
+                    // FIX: Detect underruns and log them
+                    if read_count < data.len() {
+                        log::warn!(
+                            "Audio buffer underrun: {} / {} samples available",
+                            read_count,
+                            data.len()
+                        );
+                    }
 
                     // Apply volume
                     let vol = *volume.lock();
