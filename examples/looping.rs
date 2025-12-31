@@ -1,5 +1,5 @@
-use gpui::{App, Application, Context, Render, Window, WindowOptions, div, prelude::*};
-use gpui_video::{Video, VideoOptions, video};
+use gpui::{div, prelude::*, App, Application, Context, Render, Window, WindowOptions};
+use gpui_video::{video, Video, VideoOptions};
 use std::path::PathBuf;
 use url::Url;
 
@@ -17,6 +17,7 @@ impl Render for LoopingExample {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .size_full()
+            .bg(rgb(0x151515))
             .flex()
             .items_center()
             .justify_center()

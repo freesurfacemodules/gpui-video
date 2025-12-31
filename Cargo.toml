@@ -1,16 +1,17 @@
 [package]
 name = "gpui-video"
 version = "0.1.2"
-edition = "2024"
-exclude = ["assets"]
-authors = ["nemurubaka <cijiugechu@gmail.com>"]
-description = "A video player library for gpui applications, built on top of GStreamer."
-homepage = "https://github.com/cijiugechu/gpui-video"
-repository = "https://github.com/cijiugechu/gpui-video"
+edition = "2021"
+rust-version = "1.75"
+exclude = ["assets", ".github"]
+authors = ["xhzrd"]
+description = "A high-performance video player library for GPUI applications, powered by FFmpeg and CPAL"
+homepage = "https://github.com/xhzrd/gpui-video"
+repository = "https://github.com/xhzrd/gpui-video"
 license = "MIT"
 readme = "README.md"
-keywords = ["gpui", "video", "player", "gstreamer"]
-categories = ["multimedia"]
+keywords = ["gpui", "video", "player", "ffmpeg", "multimedia"]
+categories = ["multimedia", "multimedia::video", "gui"]
 documentation = "https://docs.rs/gpui-video"
 
 [dependencies]
