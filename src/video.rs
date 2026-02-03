@@ -787,13 +787,19 @@ impl Video {
             // Keep decoding
             let vbuf_len = frame_buffer.lock().len();
             let vbuf_cap = frame_buffer_capacity.load(Ordering::SeqCst);
-            let audio_space = {
-                let ring = audio_ring.lock();
-                ring.capacity - ring.len
-            };
 
-            let should_decode = vbuf_len < (vbuf_cap * 3 / 4)
-                || audio_space > (output_sample_rate as usize / 2);
+            // Only check audio space if we actually have audio
+            let should_decode = if has_audio {
+                let audio_space = {
+                    let ring = audio_ring.lock();
+                    ring.capacity - ring.len
+                };
+                vbuf_len < (vbuf_cap * 3 / 4)
+                    || audio_space > (output_sample_rate as usize / 2)
+            } else {
+                // Video-only: just check video buffer
+                vbuf_len < (vbuf_cap * 3 / 4)
+            };
 
             if should_decode {
                 match Self::decode_next_packet(
